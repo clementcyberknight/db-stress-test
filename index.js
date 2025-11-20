@@ -8,8 +8,8 @@ dotenv.config();
 const DB_CONNECTION_STRING = process.env.DATABASE_URL;
 
 const STAGE_REQUESTS = 2000; // Number of requests to run per concurrency level
-const INITIAL_CONCURRENCY = 1000; // Start with 1000 concurrent connections
-const CONCURRENCY_STEP = 1000; // Increase by 1000 each step
+const INITIAL_CONCURRENCY = 100; // Start with 100 concurrent connections
+const CONCURRENCY_STEP = 100; // Increase by 100 each step
 const MAX_CONCURRENCY = 500000; // Stop if we reach this level
 const MAX_ERROR_RATE = 0.05; // Stop if > 5% errors
 const SKIP_SETUP = false;
