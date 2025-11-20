@@ -149,6 +149,7 @@ async function runStressTest() {
     await setupTable();
   } catch (e) {
     console.error("Failed to setup DB. Aborting.");
+    console.error(e);
     process.exit(1);
   }
 
