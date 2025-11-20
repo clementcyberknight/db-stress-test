@@ -6,8 +6,8 @@ dotenv.config();
 // --- Configuration ---
 const DB_CONNECTION_STRING = process.env.DATABASE_URL;
 const NUM_USERS = 1000000; // Simulate 1 million users
-const CONCURRENCY = 50000; // Number of simultaneous requests
-const DB_POOL_SIZE = 50000; // Should match or slightly exceed concurrency
+const CONCURRENCY = 5000; // Number of simultaneous requests
+const DB_POOL_SIZE = 5000; // Should match or slightly exceed concurrency
 const SKIP_SETUP = false;
 
 if (!DB_CONNECTION_STRING) {
