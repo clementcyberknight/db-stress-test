@@ -4,26 +4,20 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 // --- Configuration ---
+// Hardcoded settings as requested, but now defining the ramp-up strategy
 const DB_CONNECTION_STRING = process.env.DATABASE_URL;
-const NUM_USERS = 1000000; // Simulate 1 million users
-const CONCURRENCY = 5000; // Number of simultaneous requests
-const DB_POOL_SIZE = 5000; // Should match or slightly exceed concurrency
+
+const STAGE_REQUESTS = 2000; // Number of requests to run per concurrency level
+const INITIAL_CONCURRENCY = 10; // Start with 10 concurrent connections
+const CONCURRENCY_STEP = 10; // Increase by 10 each step
+const MAX_CONCURRENCY = 500; // Stop if we reach this level
+const MAX_ERROR_RATE = 0.05; // Stop if > 5% errors
 const SKIP_SETUP = false;
 
 if (!DB_CONNECTION_STRING) {
   console.error("Error: DATABASE_URL is not defined in .env");
   process.exit(1);
 }
-
-// --- Database Pool ---
-// A pool size of 10 million is unrealistic and will cause OS-level issues.
-// It's better to limit the pool and queue requests in the application.
-const pool = new Pool({
-  connectionString: DB_CONNECTION_STRING,
-  max: DB_POOL_SIZE,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-});
 
 // --- Utilities ---
 const generateRandomString = (length) => {
@@ -49,8 +43,8 @@ const generateRandomData = (userId) => {
   };
 };
 
-// --- Setup ---
-async function setupTable() {
+// --- Database Setup (One-time) ---
+async function setupTable(pool) {
   if (SKIP_SETUP) {
     console.log("Skipping table setup...");
     return;
@@ -84,23 +78,14 @@ async function setupTable() {
   }
 }
 
-// --- Statistics ---
-const stats = {
-  completed: 0,
-  errors: 0,
-  totalDuration: 0,
-  latencies: [],
-};
-
-// --- Worker Action ---
-async function performUserAction(userId) {
+// --- Single User Action ---
+async function performUserAction(pool, userId) {
   let client;
   const start = Date.now();
   try {
     client = await pool.connect();
 
     const data = generateRandomData(userId);
-
     // 1. Write
     await client.query(
       "INSERT INTO stress_test_data (user_id, name, email, gender, amount, wallet_address) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -113,120 +98,171 @@ async function performUserAction(userId) {
         data.wallet_address,
       ]
     );
-
     // 2. Read
     await client.query(
       "SELECT * FROM stress_test_data WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
       [userId]
     );
-
     const duration = Date.now() - start;
-
-    // Update stats safely (JS is single threaded for sync operations)
-    stats.completed++;
-    stats.totalDuration += duration;
-    stats.latencies.push(duration);
+    return { success: true, duration };
   } catch (err) {
-    stats.errors++;
-    // console.error(`Error for user ${userId}: ${err.message}`);
+    return { success: false, error: err };
   } finally {
     if (client) client.release();
   }
 }
 
-// --- Main Execution ---
-async function runStressTest() {
-  console.log("\n===========================================");
-  console.log("         DB STRESS TEST: ROBUST EDITION    ");
-  console.log("===========================================");
-  console.log(`Target DB:          ${new URL(DB_CONNECTION_STRING).hostname}`);
-  console.log(`Total Requests:     ${NUM_USERS}`);
-  console.log(`Concurrency:        ${CONCURRENCY}`);
-  console.log(`Pool Size:          ${DB_POOL_SIZE}`);
-  console.log("===========================================\n");
+// --- Run a Single Stage ---
+async function runStage(concurrency, requestCount) {
+  console.log(`\n--- Starting Stage: Concurrency ${concurrency} ---`);
 
-  try {
-    await setupTable();
-  } catch (e) {
-    console.error("Failed to setup DB. Aborting.");
-    console.error(e);
-    process.exit(1);
-  }
+  // Create a specific pool for this stage to test connection limits
+  const pool = new Pool({
+    connectionString: DB_CONNECTION_STRING,
+    max: concurrency, // Set pool max exactly to concurrency to test DB limits
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 5000, // Fast fail if DB is full
+  });
 
-  console.log("Starting stress test...");
+  // Handle pool errors to prevent crash
+  pool.on("error", (err) => {
+    // console.error('Unexpected error on idle client', err);
+  });
+
+  const stats = {
+    completed: 0,
+    errors: 0,
+    totalDuration: 0,
+    latencies: [],
+    connErrors: 0,
+  };
+
   const startTime = Date.now();
-
-  // Worker Pool Pattern
-  // We create 'CONCURRENCY' number of workers that keep pulling tasks until done.
   let tasksStarted = 0;
-
   const workers = [];
 
-  for (let i = 0; i < CONCURRENCY; i++) {
+  for (let i = 0; i < concurrency; i++) {
     workers.push(
       (async () => {
         while (true) {
-          // Atomically get the next task index
           const taskIndex = tasksStarted++;
-          if (taskIndex >= NUM_USERS) break;
+          if (taskIndex >= requestCount) break;
 
-          const userId = `user_${taskIndex}_${Date.now()}`;
-          await performUserAction(userId);
+          const userId = `user_${concurrency}_${taskIndex}_${Date.now()}`;
+          const result = await performUserAction(pool, userId);
 
-          // Progress Logging
-          if (
-            stats.completed > 0 &&
-            stats.completed % 1000 === 0 &&
-            taskIndex % 1000 === 0
-          ) {
-            const elapsed = (Date.now() - startTime) / 1000;
-            const rate = (stats.completed / elapsed).toFixed(2);
-            process.stdout.write(
-              `\rProgress: ${stats.completed}/${NUM_USERS} (${rate} ops/sec) | Errors: ${stats.errors}`
-            );
+          if (result.success) {
+            stats.completed++;
+            stats.totalDuration += result.duration;
+            stats.latencies.push(result.duration);
+          } else {
+            stats.errors++;
+            // Check if it's a connection error
+            if (
+              result.error.code === "53300" ||
+              result.error.message.includes("timeout")
+            ) {
+              stats.connErrors++;
+            }
           }
         }
       })()
     );
   }
 
-  // Wait for all workers to finish
   await Promise.all(workers);
+
+  await pool.end();
 
   const totalTime = (Date.now() - startTime) / 1000;
   const throughput = stats.completed / totalTime;
+  const avgLatency =
+    stats.completed > 0 ? stats.totalDuration / stats.completed : 0;
+  const errorRate = stats.errors / requestCount;
 
-  // Calculate Percentiles
-  stats.latencies.sort((a, b) => a - b);
-  const getPercentile = (p) => {
-    if (stats.latencies.length === 0) return 0;
-    const index = Math.floor((p / 100) * stats.latencies.length);
-    return stats.latencies[index];
+  console.log(`Stage Completed:`);
+  console.log(`  Throughput: ${throughput.toFixed(2)} ops/sec`);
+  console.log(`  Avg Latency: ${avgLatency.toFixed(2)} ms`);
+  console.log(`  Errors: ${stats.errors} (${(errorRate * 100).toFixed(1)}%)`);
+
+  if (stats.connErrors > 0) {
+    console.log(
+      `  WARNING: ${stats.connErrors} connection errors detected (DB limit hit?)`
+    );
+  }
+
+  return {
+    concurrency,
+    throughput,
+    avgLatency,
+    errorRate,
+    hasCriticalFailure: stats.connErrors > 0 || errorRate > MAX_ERROR_RATE,
   };
-
-  console.log("\n\n===========================================");
-  console.log("           STRESS TEST RESULTS             ");
-  console.log("===========================================");
-  console.log(`Total Requests:     ${NUM_USERS}`);
-  console.log(`Successful:         ${stats.completed}`);
-  console.log(`Failed:             ${stats.errors}`);
-  console.log(`Total Time:         ${totalTime.toFixed(2)} s`);
-  console.log(`Throughput:         ${throughput.toFixed(2)} ops/sec`);
-  console.log("-------------------------------------------");
-  console.log(
-    `Latency (avg):      ${(
-      stats.totalDuration / (stats.completed || 1)
-    ).toFixed(2)} ms`
-  );
-  console.log(`Latency (p50):      ${getPercentile(50)} ms`);
-  console.log(`Latency (p95):      ${getPercentile(95)} ms`);
-  console.log(`Latency (p99):      ${getPercentile(99)} ms`);
-  console.log(
-    `Latency (max):      ${stats.latencies[stats.latencies.length - 1] || 0} ms`
-  );
-  console.log("===========================================");
-
-  await pool.end();
 }
 
-runStressTest().catch((err) => console.error(err));
+// --- Main Progressive Test ---
+async function runProgressiveTest() {
+  console.log("\n===========================================");
+  console.log("      PROGRESSIVE DB STRESS TEST           ");
+  console.log("===========================================");
+  console.log(`Target DB:          ${new URL(DB_CONNECTION_STRING).hostname}`);
+  console.log(
+    `Ramp Up:            ${INITIAL_CONCURRENCY} -> ${MAX_CONCURRENCY} (Step: ${CONCURRENCY_STEP})`
+  );
+  console.log(`Requests per Stage: ${STAGE_REQUESTS}`);
+  console.log("===========================================\n");
+
+  // Initial setup using a small pool
+  const setupPool = new Pool({
+    connectionString: DB_CONNECTION_STRING,
+    max: 5,
+  });
+  try {
+    await setupTable(setupPool);
+  } catch (e) {
+    console.error("Setup failed:", e.message);
+    process.exit(1);
+  } finally {
+    await setupPool.end();
+  }
+
+  let currentConcurrency = INITIAL_CONCURRENCY;
+  const report = [];
+
+  while (currentConcurrency <= MAX_CONCURRENCY) {
+    const result = await runStage(currentConcurrency, STAGE_REQUESTS);
+    report.push(result);
+
+    if (result.hasCriticalFailure) {
+      console.log("\n!!! CRITICAL FAILURE DETECTED. STOPPING TEST. !!!");
+      console.log(
+        `Stable concurrency limit seems to be around ${
+          currentConcurrency - CONCURRENCY_STEP
+        }`
+      );
+      break;
+    }
+
+    currentConcurrency += CONCURRENCY_STEP;
+    // Small pause between stages
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  console.log("\n\n===========================================");
+  console.log("           FINAL REPORT                    ");
+  console.log("===========================================");
+  console.log("Concurrency | TPS      | Latency (ms) | Error Rate");
+  console.log("-------------------------------------------");
+  report.forEach((r) => {
+    console.log(
+      `${r.concurrency.toString().padEnd(12)}| ${r.throughput
+        .toFixed(0)
+        .padEnd(9)}| ${r.avgLatency.toFixed(2).padEnd(13)}| ${(
+        r.errorRate * 100
+      ).toFixed(1)}%`
+    );
+  });
+  console.log("===========================================");
+}
+
+runProgressiveTest().catch((err) => console.error(err));
